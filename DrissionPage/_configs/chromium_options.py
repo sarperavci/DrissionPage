@@ -6,8 +6,21 @@
 """
 from pathlib import Path
 from re import search
+import asyncio
+import threading
+import socket
+from urllib.parse import urlparse, uses_netloc
 
 from .options_manage import OptionsManager
+from .._functions.settings import Settings as _S
+
+_COMMON_PROXY_SCHEMES = ['http', 'https', 'socks', 'socks4', 'socks5', 'ss', 'ssr', 'trojan']
+uses_netloc.extend(_COMMON_PROXY_SCHEMES)
+
+try:
+    import pproxy
+except ImportError:
+    pproxy = None
 
 
 class ChromiumOptions(object):
@@ -19,13 +32,23 @@ class ChromiumOptions(object):
         self._is_headless = False
         self._ua_set = False
 
+        # pproxy related attributes
+        self._pproxy_server_thread = None
+        self._pproxy_server_handler = None
+        self._pproxy_local_port = None
+        self._pproxy_loop = None
+        self._pproxy_stop_event = None
+        self._original_proxy_str = None
+
+        self._proxy = None
+
         if read_file is False:
             ini_path = False
             self.ini_path = None
         elif ini_path:
             ini_path = Path(ini_path).absolute()
             if not ini_path.exists():
-                raise ValueError(f'文件不存在：{ini_path}')
+                raise FileNotFoundError(_S._lang.join(_S._lang.INI_NOT_FOUND, PATH=ini_path))
             self.ini_path = str(ini_path)
         else:
             self.ini_path = str(Path(__file__).parent / 'configs.ini')
@@ -49,7 +72,11 @@ class ChromiumOptions(object):
                 self._is_headless = True
                 break
 
-        self._proxy = om.proxies.get('http', None) or om.proxies.get('https', None)
+        loaded_proxy_config = om.proxies.get('http', None) or om.proxies.get('https', None)
+        if loaded_proxy_config:
+            self.set_proxy(loaded_proxy_config)
+        else:
+            self._proxy = None
 
         user_path = user = False
         for arg in self._arguments:
@@ -284,17 +311,146 @@ class ChromiumOptions(object):
     def set_user_agent(self, user_agent):
         return self.set_argument('--user-agent', user_agent)
 
-    def set_proxy(self, proxy):
-        if search(r'.*?:.*?@.*?\..*', proxy):
-            print('你似乎在设置使用账号密码的代理，暂时不支持这种代理，可自行用插件实现需求。')
-        if proxy.lower().startswith('socks'):
-            print('你似乎在设置使用socks代理，暂时不支持这种代理，可自行用插件实现需求。')
-        self._proxy = proxy
-        return self.set_argument('--proxy-server', proxy)
+    @staticmethod
+    def _find_free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    def _start_pproxy_server(self, remote_proxy_uri_input):
+        if not pproxy:
+            return False
+
+        self._pproxy_local_port = self._find_free_port()
+        local_listen_uri = f"http://127.0.0.1:{self._pproxy_local_port}"
+        self._original_proxy_str = remote_proxy_uri_input
+
+        pproxy_uri_to_connect_with = remote_proxy_uri_input
+        try:
+            parsed = urlparse(remote_proxy_uri_input)
+            if parsed.scheme.lower() in ('socks', 'socks4', 'socks5') and parsed.username:
+                host_port = parsed.hostname
+                if parsed.port:
+                    host_port += f":{parsed.port}"
+                
+                auth_part = parsed.username
+                if parsed.password:
+                    auth_part += f":{parsed.password}"
+                
+                path_query_fragment = parsed.path
+                if parsed.query:
+                    path_query_fragment += f"?{parsed.query}"
+                
+                pproxy_uri_to_connect_with = f"{parsed.scheme}://{host_port}{path_query_fragment}#{auth_part}"
+        except Exception as e:
+            pass
+
+        def pproxy_thread_target():
+            self._pproxy_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._pproxy_loop)
+            self._pproxy_stop_event = asyncio.Event()
+
+            server = pproxy.Server(local_listen_uri)
+            remote = pproxy.Connection(pproxy_uri_to_connect_with)
+            args = dict(rserver=[remote], verbose=lambda *a, **kw: None)
+
+            async def main_task():
+                try:
+                    self._pproxy_server_handler = await server.start_server(args)
+                    await self._pproxy_stop_event.wait()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    print(f"ERROR: pproxy server task encountered an error: {e}")
+                finally:
+                    if self._pproxy_server_handler:
+                        self._pproxy_server_handler.close()
+                        try:
+                            await asyncio.wait_for(self._pproxy_server_handler.wait_closed(), timeout=2.0)
+                        except asyncio.TimeoutError:
+                            pass
+            
+            try:
+                self._pproxy_loop.run_until_complete(main_task())
+            finally:
+                try:
+                    if self._pproxy_loop.is_running():
+                        self._pproxy_loop.call_soon_threadsafe(self._pproxy_loop.stop)
+                    self._pproxy_loop.run_until_complete(self._pproxy_loop.shutdown_asyncgens())
+                except Exception:
+                    pass
+                finally:
+                    self._pproxy_loop.close()
+
+        self._pproxy_server_thread = threading.Thread(target=pproxy_thread_target, daemon=True)
+        self._pproxy_server_thread.start()
+        return True
+
+    def _stop_pproxy_server(self):
+        if self._pproxy_server_thread and self._pproxy_server_thread.is_alive():
+            if self._pproxy_loop and self._pproxy_stop_event and not self._pproxy_stop_event.is_set():
+                self._pproxy_loop.call_soon_threadsafe(self._pproxy_stop_event.set)
+            
+            self._pproxy_server_thread.join(timeout=5.0)
+            if self._pproxy_server_thread.is_alive():
+                print("WARNING: pproxy server thread did not stop gracefully.")
+
+        self._pproxy_server_thread = None
+        self._pproxy_server_handler = None
+        self._pproxy_loop = None
+        self._pproxy_stop_event = None
+        self._original_proxy_str = None
+
+    def set_proxy(self, proxy_str_input):
+        self._stop_pproxy_server()
+
+        if not proxy_str_input:
+            self._proxy = None
+            self.remove_argument('--proxy-server')
+            return self
+
+        effective_chromium_proxy_uri = proxy_str_input
+        pproxy_successfully_handled = False
+
+        try:
+            parsed_url = urlparse(proxy_str_input)
+            scheme = parsed_url.scheme.lower()
+            has_auth = bool(parsed_url.username or parsed_url.password)
+        except Exception:
+            scheme = ""
+            has_auth = False
+
+        needs_pproxy_wrapper = False
+        if scheme in ('socks', 'socks4', 'socks5'):
+            needs_pproxy_wrapper = True
+        elif scheme in ('http', 'https') and has_auth:
+            needs_pproxy_wrapper = True
+        elif scheme in ('ss', 'ssr', 'trojan'):
+            needs_pproxy_wrapper = True
+
+        if needs_pproxy_wrapper:
+            if not pproxy:
+                print(f"INFO: pproxy library is not installed. Proxy '{proxy_str_input}' requires it. Chromium will attempt to use the original string.")
+            elif self._start_pproxy_server(proxy_str_input):
+                effective_chromium_proxy_uri = f"http://127.0.0.1:{self._pproxy_local_port}"
+                pproxy_successfully_handled = True
+            else:
+                print(f"INFO: Failed to start pproxy for '{proxy_str_input}'. Chromium will attempt to use the original string.")
+        
+        self._proxy = effective_chromium_proxy_uri
+        
+        if not pproxy_successfully_handled:
+            if search(r'.*?:.*?@.*?\..*', proxy_str_input):
+                print(_S._lang.UNSUPPORTED_USER_PROXY)
+            if proxy_str_input.lower().startswith('socks'):
+                print(_S._lang.UNSUPPORTED_SOCKS_PROXY)
+                
+        return self.set_argument('--proxy-server', self._proxy)
 
     def set_load_mode(self, value):
         if value not in ('normal', 'eager', 'none'):
-            raise ValueError("只能选择 'normal', 'eager', 'none'。")
+            raise ValueError(_S._lang.join(_S._lang.INCORRECT_VAL_, 'value',
+                                           ALLOW_VAL="'normal', 'eager', 'none'", CURR_VAL=value))
         self._load_mode = value.lower()
         return self
 
@@ -377,6 +533,12 @@ class ChromiumOptions(object):
         self._existing_only = on_off
         return self
 
+    def cleanup(self):
+        self._stop_pproxy_server()
+
+    def __del__(self):
+        self.cleanup()
+
     def save(self, path=None):
         if path == 'default':
             path = (Path(__file__).parent / 'configs.ini').absolute()
@@ -402,9 +564,15 @@ class ChromiumOptions(object):
                  'auto_port', 'system_user_path', 'existing_only', 'flags', 'new_env')
         for i in attrs:
             om.set_item('chromium_options', i, self.__getattribute__(f'_{i}'))
-        # 设置代理
-        om.set_item('proxies', 'http', self._proxy or '')
-        om.set_item('proxies', 'https', self._proxy or '')
+
+        proxy_to_save_in_config = self._original_proxy_str if self._original_proxy_str else self._proxy
+
+        om.set_item('proxies', 'http', proxy_to_save_in_config or '')
+        if proxy_to_save_in_config and proxy_to_save_in_config.lower().startswith('https://'):
+            om.set_item('proxies', 'https', proxy_to_save_in_config)
+        else:
+            om.set_item('proxies', 'https', '')
+
         # 设置路径
         om.set_item('paths', 'download_path', self._download_path or '')
         om.set_item('paths', 'tmp_path', self._tmp_path or '')

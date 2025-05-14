@@ -6,3 +6,4 @@ websocket-client
 click
 tldextract>=3.4.4
 psutil
+pproxy
